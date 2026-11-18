@@ -1,14 +1,54 @@
 /* Cliente sin secretos: autorización y descuentos de inventario se ejecutan en PostgreSQL. */
 const $=id=>document.getElementById(id), money=n=>new Intl.NumberFormat('es-MX',{style:'currency',currency:'MXN'}).format(Number(n||0));
 const escapeHtml=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-let activeCategory='todos';const categoryLabels={todos:'🍽️ Todos',barbacoa:'🌮 Barbacoa',lonches:'🥖 Lonches',vapor:'🫔 Al vapor',cafe:'☕ Café',combos:'🎁 Combos',otros:'🍴 Otros'};let db,user,role='seller',products=[],ingredients=[],recipes=[],cart={},modifiers=[],comboParts=[],sales=[],reorderRows=[],lastTicket=null;
+let businessSettings={name:'Mi Puesto • Barbacoa y Café',ticket_message:'¡Gracias por su compra!'};let activeCategory='todos';const categoryLabels={todos:'🍽️ Todos',barbacoa:'🌮 Barbacoa',lonches:'🥖 Lonches',vapor:'🫔 Al vapor',cafe:'☕ Café',combos:'🎁 Combos',otros:'🍴 Otros'};let db,user,role='seller',products=[],ingredients=[],recipes=[],cart={},modifiers=[],comboParts=[],sales=[],reorderRows=[],lastTicket=null;
 function toast(msg){$('notice').textContent=msg;$('notice').classList.add('show');setTimeout(()=>$('notice').classList.remove('show'),4500)}
 function fail(e){toast('Error: '+(e?.message||e))}function check(r){if(r.error)throw r.error;return r.data}
-function config(){try{return JSON.parse(localStorage.getItem('pos-config')||'null')}catch{return null}}
-async function init(){const c=config();$('setup').hidden=!!c;if(!c)return;try{db=supabase.createClient(c.url,c.key);const {data:{session}}=await db.auth.getSession();await sessionChanged(session);db.auth.onAuthStateChange((_event,s)=>{setTimeout(()=>sessionChanged(s).catch(fail),0)})}catch(e){fail(e);$('setup').hidden=false}}
-async function sessionChanged(s){user=s?.user||null;$('auth').hidden=!!user;$('app').hidden=!user;$('logout').hidden=!user;$('status').textContent=user?.email||'Sin sesión';if(user){try{const r=check(await db.from('profiles').select('role').eq('id',user.id).single());role=r.role;$('admin').hidden=role!=='admin';document.querySelector('[data-tab="admin"]').hidden=role!=='admin';$('supervision').hidden=role!=='admin';document.querySelector('[data-tab="supervision"]').hidden=role!=='admin';await load()}catch(e){fail(e)}}}
-$('saveConfig').onclick=()=>{const url=$('url').value.trim(),key=$('key').value.trim();if(!/^https:\/\/[a-z0-9-]+\.supabase\.co\/?$/i.test(url)||!key)return toast('Verifica URL y clave pública');localStorage.setItem('pos-config',JSON.stringify({url:url.replace(/\/$/,''),key}));location.reload()};
-$('login').onclick=async()=>{try{check(await db.auth.signInWithPassword({email:$('email').value.trim(),password:$('password').value}));}catch(e){fail(e)}};
+// Configuración permanente: primero archivo de despliegue, después almacenamiento local.
+// No almacenar contraseñas ni claves secretas; solo URL y clave pública de Supabase.
+const CONFIG_STORAGE_KEY='pos-config';
+function validConfig(c){return !!(c && typeof c.url==='string' && /^https:\/\/[a-z0-9-]+\.supabase\.co\/?$/i.test(c.url.trim()) && typeof c.key==='string' && c.key.trim())}
+function savedConfig(){try{const raw=localStorage.getItem(CONFIG_STORAGE_KEY);return raw?JSON.parse(raw):null}catch(e){return null}}
+function config(){const fixed=window.POS_PUBLIC_CONFIG;if(validConfig(fixed))return {url:fixed.url.trim().replace(/\/$/,''),key:fixed.key.trim()};const local=savedConfig();return validConfig(local)?{url:local.url.trim().replace(/\/$/,''),key:local.key.trim()}:null}
+function showSetup(message){$('setup').hidden=false;$('auth').hidden=true;$('app').hidden=true;$('logout').hidden=true;if(message)$('status').textContent=message;const c=savedConfig();if(c){$('url').value=c.url||'';$('key').value=c.key||''}}
+async function init(){
+ const c=config();if(!c){showSetup('Configuración inicial pendiente');return}
+ $('setup').hidden=true;$('status').textContent='Conectando a la base de datos…';
+ try{
+  if(!window.supabase?.createClient)throw new Error('No se pudo cargar la biblioteca Supabase. Verifica tu conexión a internet.');
+  db=supabase.createClient(c.url,c.key,{auth:{persistSession:true,autoRefreshToken:true,detectSessionInUrl:true}});
+  const {data,error}=await db.auth.getSession();if(error)throw error;
+  await sessionChanged(data?.session||null);
+  db.auth.onAuthStateChange((_event,s)=>{setTimeout(()=>sessionChanged(s).catch(fail),0)});
+ }catch(e){
+  // Un fallo de red o de autenticación NO elimina ni solicita nuevamente la configuración.
+  fail(e);$('status').textContent='No se pudo conectar. Revisa internet y recarga.';
+  $('auth').hidden=false;
+ }
+}
+async function sessionChanged(session){
+ user=session?.user||null;
+ $('auth').hidden=!!user;$('app').hidden=!user;$('logout').hidden=!user;$('setup').hidden=true;
+ if(!user){role='seller';$('status').textContent='Inicia sesión';return}
+ const profile=check(await db.from('profiles').select('role,enabled').eq('id',user.id).single());
+ if(profile.enabled===false){await db.auth.signOut();throw new Error('Cuenta deshabilitada. Contacta a gerencia.')}
+ role=profile.role||'seller';
+ $('status').textContent=(role==='manager'?'Gerente general':role==='admin'?'Administrador':'Vendedor')+' · '+user.email;
+ document.querySelector('[data-tab="admin"]').hidden=!['admin','manager'].includes(role);
+ document.querySelector('[data-tab="supervision"]').hidden=!['admin','manager'].includes(role);
+ document.querySelector('[data-tab="manager"]').hidden=role!=='manager';
+ await load();if(role==='manager')await loadManager();
+}
+$('saveConfig').onclick=()=>{
+ const url=$('url').value.trim().replace(/\/$/,''),key=$('key').value.trim();
+ if(!validConfig({url,key}))return toast('Verifica URL y clave pública de Supabase');
+ try{
+  localStorage.setItem(CONFIG_STORAGE_KEY,JSON.stringify({url,key}));
+  if(!validConfig(savedConfig()))throw new Error('No se pudo verificar el almacenamiento');
+  location.reload();
+ }catch(e){toast('El navegador impide guardar datos. Configura config.js en el servidor para una conexión permanente.');}
+};
+$('login').onclick=async()=>{try{if(!db)throw new Error('Sin conexión a Supabase. Revisa internet y recarga.');check(await db.auth.signInWithPassword({email:$('email').value.trim(),password:$('password').value}));}catch(e){fail(e)}};
 $('logout').onclick=async()=>{await db.auth.signOut();location.reload()};
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{if(b.hidden)return;document.querySelectorAll('nav button').forEach(x=>x.classList.toggle('active',x===b));document.querySelectorAll('.tab').forEach(x=>x.hidden=x.id!==b.dataset.tab)});
 async function load(){try{[products,ingredients,recipes,modifiers,comboParts]=await Promise.all([db.from('products').select('*').eq('active',true).order('name').then(check),db.from('ingredients').select('*').order('name').then(check),db.from('recipes').select('*').then(check),db.from('modifiers').select('*').eq('active',true).then(check),db.from('combo_parts').select('*').then(check)]);render()}catch(e){fail(e)}}
@@ -96,7 +136,7 @@ async function fetchAllDashboard(tableName,fields,filter,limit=10000){
 function dashTable(headers,rows){return rows.length?table(headers,rows):'<p class="muted">Sin datos para la fecha seleccionada.</p>'}
 function dashBar(label,value,max){const pct=max>0?Math.max(0,Math.min(100,value/max*100)):0;return `<div class="dash-bar"><span>${escapeHtml(label)}</span><div class="dash-track"><div style="width:${pct.toFixed(2)}%"></div></div><strong>${money(value)}</strong></div>`}
 async function refreshDashboard(){
- if(role!=='admin'||!user)return;
+ if(!['admin','manager'].includes(role)||!user)return;
  const date=$('dashDate').value;if(!date)return toast('Selecciona una fecha');const button=$('dashRefresh');button.disabled=true;
  try{
   const [start,end]=dashDateRange(date);
@@ -126,3 +166,37 @@ $('dashDate').value=new Date().toLocaleDateString('en-CA');
 $('dashRefresh').onclick=refreshDashboard;
 $('dashExport').onclick=()=>dashboardExport.length?csv('tablero_propietario_'+$('dashDate').value+'.csv',dashboardExport):toast('Actualiza el tablero antes de exportar');
 document.querySelector('[data-tab="supervision"]').addEventListener('click',refreshDashboard);
+
+
+// V8 Gerencia general: controles de edición restringidos también por RLS/RPC en PostgreSQL.
+let mgrProducts=[],mgrIngredients=[],mgrModifiers=[],mgrRecipes=[],mgrCombos=[],mgrUsers=[];
+const mEl=(tag,txt)=>{const e=document.createElement(tag);if(txt!==undefined)e.textContent=String(txt);return e};
+function mButton(label,fn,css=''){const b=mEl('button',label);if(css)b.className=css;b.onclick=fn;return b}
+function mField(label,value,type='text'){const w=mEl('label',label),i=document.createElement('input');i.type=type;i.value=value??'';if(type==='number')i.step='0.001';w.append(i);return [w,i]}
+function mSelect(label,values,selected){const w=mEl('label',label),s=document.createElement('select');for(const [val,txt] of values){const o=mEl('option',txt);o.value=val;s.append(o)}s.value=selected??'';w.append(s);return [w,s]}
+function mRow(container,title,fields,onSave,onToggle,toggleText){const card=mEl('div');card.className='manager-card';card.append(mEl('h4',title));const values={};for(const [key,label,value,type,options] of fields){const [wrapper,input]=options?mSelect(label,options,value):mField(label,value,type);card.append(wrapper);values[key]=input}card.append(mButton('Guardar cambios',async()=>{try{await onSave(Object.fromEntries(Object.entries(values).map(([k,v])=>[k,v.value])));await load();await loadManager();toast('Cambios guardados')}catch(e){fail(e)}}));if(onToggle)card.append(mButton(toggleText,async()=>{if(!confirm('¿Confirmas esta operación?'))return;try{await onToggle();await load();await loadManager();toast('Estado actualizado')}catch(e){fail(e)}},'secondary'));container.append(card)}
+async function mUpdate(table,id,values){check(await db.from(table).update(values).eq('id',id))}
+async function loadManager(){if(role!=='manager')return;try{
+ [mgrProducts,mgrIngredients,mgrModifiers,mgrRecipes,mgrCombos,mgrUsers]=await Promise.all([
+ db.from('products').select('*').order('name').then(check),db.from('ingredients').select('*').order('name').then(check),db.from('modifiers').select('*').order('group_name').then(check),db.from('recipes').select('*').then(check),db.from('combo_parts').select('*').then(check),db.from('profiles').select('id,role,enabled').order('created_at').then(check)]);
+ renderManager();const settings=check(await db.from('app_settings').select('key,value').in('key',['business_name','ticket_message']));businessSettings.name=settings.find(x=>x.key==='business_name')?.value||businessSettings.name;businessSettings.ticket_message=settings.find(x=>x.key==='ticket_message')?.value||businessSettings.ticket_message;$('businessName').value=businessSettings.name;$('ticketMessage').value=businessSettings.ticket_message;
+ }catch(e){fail(e)}}
+function renderManager(){
+ const productBox=$('managerProducts');productBox.replaceChildren();productBox.append(mButton('➕ Crear nuevo artículo',()=>switchTab('admin')));
+ for(const p of mgrProducts)mRow(productBox,p.name,[['name','Nombre',p.name],['category','Categoría',p.category],['emoji','Icono',p.emoji],['price','Precio',p.price,'number'],['production_target','Meta producción',p.production_target,'number']],v=>mUpdate('products',p.id,{...v,price:Number(v.price),production_target:Number(v.production_target)}),()=>mUpdate('products',p.id,{active:!p.active}),p.active?'Dar de baja':'Reactivar');
+ const ib=$('managerIngredients');ib.replaceChildren();ib.append(mButton('➕ Crear insumo',()=>switchTab('admin')));
+ for(const i of mgrIngredients)mRow(ib,i.name,[['name','Nombre',i.name],['unit','Unidad',i.unit],['min_stock','Mínimo',i.min_stock,'number'],['target_stock','Objetivo',i.target_stock,'number']],v=>mUpdate('ingredients',i.id,{...v,min_stock:Number(v.min_stock),target_stock:Number(v.target_stock)}),null);
+ const mb=$('managerModifiers');mb.replaceChildren();mb.append(mButton('➕ Nueva opción',()=>switchTab('admin')));
+ for(const m of mgrModifiers)mRow(mb,m.group_name+' · '+m.name,[['group_name','Grupo',m.group_name],['name','Opción',m.name],['price_delta','Cargo',m.price_delta,'number'],['ingredient_quantity','Consumo adicional',m.ingredient_quantity,'number']],v=>mUpdate('modifiers',m.id,{...v,price_delta:Number(v.price_delta),ingredient_quantity:Number(v.ingredient_quantity)}),()=>mUpdate('modifiers',m.id,{active:!m.active}),m.active?'Desactivar':'Reactivar');
+ const rb=$('managerRecipes');rb.replaceChildren();rb.append(mButton('➕ Nueva receta',()=>switchTab('admin')));
+ for(const r of mgrRecipes){const name=(mgrProducts.find(p=>p.id===r.product_id)?.name||'Artículo')+' / '+(mgrIngredients.find(i=>i.id===r.ingredient_id)?.name||'Insumo');mRow(rb,name,[['quantity','Cantidad por venta',r.quantity,'number']],v=>check(db.from('recipes').update({quantity:Number(v.quantity)}).eq('product_id',r.product_id).eq('ingredient_id',r.ingredient_id)),async()=>check(await db.from('recipes').delete().eq('product_id',r.product_id).eq('ingredient_id',r.ingredient_id)),'Quitar de receta')}
+ const cb=$('managerCombos');cb.replaceChildren();cb.append(mButton('➕ Crear combo',()=>switchTab('admin')));
+ for(const c of mgrCombos){const name=(mgrProducts.find(p=>p.id===c.combo_id)?.name||'Combo')+' / '+(mgrProducts.find(p=>p.id===c.product_id)?.name||'Artículo');mRow(cb,name,[['quantity','Unidades',c.quantity,'number']],v=>check(db.from('combo_parts').update({quantity:Number(v.quantity)}).eq('combo_id',c.combo_id).eq('product_id',c.product_id)),async()=>check(await db.from('combo_parts').delete().eq('combo_id',c.combo_id).eq('product_id',c.product_id)),'Quitar componente')}
+ const ub=$('managerUsers');ub.replaceChildren();const roles=[['seller','Vendedor'],['admin','Administrador'],['manager','Gerente general']];
+ for(const u of mgrUsers)mRow(ub,u.id===user.id?'Mi cuenta · '+u.id:u.id,[['role','Perfil',u.role,'text',roles]],async v=>{check(await db.rpc('manager_update_profile',{p_user:u.id,p_role:v.role,p_enabled:u.enabled}))},async()=>{check(await db.rpc('manager_update_profile',{p_user:u.id,p_role:u.role,p_enabled:!u.enabled}))},u.enabled?'Deshabilitar acceso':'Habilitar acceso');
+}
+function switchTab(name){const b=document.querySelector('nav [data-tab="'+name+'"]');if(b&&!b.hidden)b.click()}
+document.querySelectorAll('[data-manager]').forEach(b=>b.onclick=()=>{document.querySelectorAll('.manager-page').forEach(p=>p.hidden=p.id!==b.dataset.manager);document.querySelectorAll('[data-manager]').forEach(x=>x.classList.toggle('active',x===b))});
+document.querySelector('[data-tab="manager"]').addEventListener('click',loadManager);
+$('saveBusiness').onclick=async()=>{if(role!=='manager')return;try{for(const [key,value] of [['business_name',$('businessName').value.trim()],['ticket_message',$('ticketMessage').value.trim()]])check(await db.from('app_settings').upsert({key,value},{onConflict:'key'}));toast('Configuración guardada');await loadManager()}catch(e){fail(e)}};
+$('managerGoCatalog').onclick=()=>switchTab('admin');$('managerGoDashboard').onclick=()=>switchTab('supervision');

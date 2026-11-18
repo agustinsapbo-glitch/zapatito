@@ -95,3 +95,7 @@ El navegador no puede seleccionar automáticamente cualquier impresora USB/Bluet
 6. Un administrador puede consultar los turnos de todos los empleados. Los empleados únicamente pueden consultar sus propios turnos. El historial se exporta a CSV (hasta 500 turnos recientes por carga).
 
 **Consideraciones:** cada usuario solo puede tener un turno abierto. Cada venta se asocia automáticamente al turno del empleado, incluso cuando varios venden a la vez. Las ventas anteriores a esta actualización no pertenecen a ningún turno. Los turnos cerrados conservan su corte calculado y no se pueden reabrir desde la interfaz. El sistema no incluye devoluciones, cancelaciones ni arqueo por denominaciones. Prueba el flujo completo en un proyecto Supabase de prueba antes de usarlo en producción.
+
+
+## Versión 7 — conexión permanente
+Consulta `ACTUALIZACION_V7_CONEXION.md`. Para equipos múltiples, configura la URL y la clave **pública** en `config.js` una sola vez al publicar. No uses claves secretas.
